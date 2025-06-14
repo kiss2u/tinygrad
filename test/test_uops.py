@@ -13,7 +13,7 @@ from tinygrad.renderer import ProgramSpec
 from tinygrad.engine.grouper import fix_kernel_ops
 from tinygrad.engine.realize import CompiledRunner, get_kernel
 from tinygrad.codegen import full_rewrite
-from tinygrad.codegen.symbolic import sym
+from tinygrad.uop.symbolic import sym
 from tinygrad.device import is_dtype_supported
 from tinygrad.codegen.kernel import Kernel, Opt, OptOps
 
@@ -361,15 +361,16 @@ class TestAssembly(unittest.TestCase):
     self.assertIn(Ops.MUL, ops)
 
   def test_division_power_of_two(self):
-    g = UOp(Ops.DEFINE_GLOBAL, dtypes.uint32.ptr(), (), 0)
-    c = UOp(Ops.CONST, dtypes.uint, (), 2)
-    l = UOp(Ops.LOAD, dtypes.uint, (g.index(c),))
-    a = UOp(Ops.IDIV, dtypes.uint, (l, c))
-    uops = to_uops_list([a], opts=Device[Device.DEFAULT].renderer)
-    Device[Device.DEFAULT].renderer.render(uops)
-    ops = [x.op for x in uops]
-    self.assertIn(Ops.SHR, ops)
-    self.assertNotIn(Ops.IDIV, ops)
+    for dt in (dtypes.int32, dtypes.uint32):
+      g = UOp(Ops.DEFINE_GLOBAL, dt.ptr(), (), 0)
+      c = UOp(Ops.CONST, dt, (), 2)
+      l = UOp(Ops.LOAD, dt, (g.index(c),))
+      a = UOp(Ops.IDIV, dt, (l, c))
+      uops = to_uops_list([a], opts=Device[Device.DEFAULT].renderer)
+      Device[Device.DEFAULT].renderer.render(uops)
+      ops = [x.op for x in uops]
+      self.assertIn(Ops.SHR, ops, f"For dtype={dt} divison by power of two did not simplify to shift")
+      self.assertNotIn(Ops.IDIV, ops, f"For dtype={dt} divison by power of two did not simplify to shift")
 
   def test_fast_idiv_and_mod(self):
     g = UOp(Ops.DEFINE_GLOBAL, dtypes.uint32.ptr(), (), 0)
@@ -476,7 +477,7 @@ class TestUOpStr(unittest.TestCase):
     assert str(eval(str(device))) == str(device)
 
   def test_reduceop_arg(self):
-    sum_uop = Tensor.empty(32, 32).sum().lazydata
+    sum_uop = Tensor.empty(32, 32).sum().uop
     assert str(eval(str(sum_uop))) == str(sum_uop)
 
 @unittest.skip("uop no longer has order like this")
@@ -549,9 +550,9 @@ class TestShapeSpec(unittest.TestCase):
   # ** CONST is CONST(VIEW(DEVICE)) -> RESHPAE -> EXPAND
 
   def test_expanded_const(self):
-    a = Tensor(1).lazydata
+    a = Tensor(1).uop
     self.assertEqual(a.st, ShapeTracker.from_shape(()))
-    a = Tensor.ones((4, 4)).lazydata
+    a = Tensor.ones((4, 4)).uop
     self.assertEqual(a.st, ShapeTracker.from_shape(()).reshape((1,1)).expand((4,4)))
 
   def test_padded_const(self):
@@ -569,12 +570,12 @@ class TestShapeSpec(unittest.TestCase):
 
   # NOTE: CONST ShapeTracker comes from its source
   def test_scalar_const(self):
-    a = Tensor(0).lazydata
+    a = Tensor(0).uop
     self.assertEqual(a.st, ShapeTracker.from_shape(()))
 
   def test_scalar_var(self):
     vv = UOp.variable("a", 1, 4).bind(2)
-    t = Tensor(vv).lazydata
+    t = Tensor(vv).uop
     self.assertEqual(t.st, ShapeTracker.from_shape(()))
 
   # ** ASSIGN is ASSIGN(VIEW(BUFFER), new_val)
@@ -583,7 +584,7 @@ class TestShapeSpec(unittest.TestCase):
     buffer = Tensor.arange(4).realize()
     a = buffer.assign(Tensor.zeros((4,), dtype=dtypes.int))
     assign_pattern = UPat(Ops.ASSIGN, src=(UPat(Ops.BUFFER), UPat()))
-    assert assign_pattern.match(a.lazydata, {})
+    assert assign_pattern.match(a.uop, {})
     a.realize()
     self.assertEqual(buffer.tolist(), [0, 0, 0, 0])
 
@@ -597,7 +598,7 @@ class TestShapeSpec(unittest.TestCase):
     buffer = Tensor.ones((4,)).contiguous().realize()
     a = buffer.reshape((2, 2)).assign(Tensor.zeros((2, 2)))
     assign_pattern = UPat(Ops.ASSIGN, src=(UPat(Ops.RESHAPE, src=(UPat(Ops.BUFFER))), UPat()))
-    assert assign_pattern.match(a.lazydata, {})
+    assert assign_pattern.match(a.uop, {})
     a.realize()
     self.assertEqual(buffer.tolist(), [0, 0, 0, 0])
 
@@ -606,13 +607,13 @@ class TestShapeSpec(unittest.TestCase):
     a = Tensor.ones((4,)).contiguous().realize()
     assign = a.shrink(((1, 2),)).assign(Tensor.zeros((1,)))
     # the ASSIGN UOp has size=1
-    self.assertEqual(assign.lazydata.size, 1)
+    self.assertEqual(assign.uop.size, 1)
     # the ASSIGN views the buffer with a shrunk st
-    self.assertEqual(assign.lazydata.src[0].st, ShapeTracker.from_shape((4,)).shrink(((1, 2),)))
+    self.assertEqual(assign.uop.src[0].st, ShapeTracker.from_shape((4,)).shrink(((1, 2),)))
     # the underlying BUFFER has a size=4
-    self.assertEqual(assign.lazydata.buf_uop.size, 4)
+    self.assertEqual(assign.uop.buf_uop.size, 4)
     # NOTE: output shape is different from the BUFFER shape
-    self.assertNotEqual(assign.lazydata.shape, a.lazydata.shape)
+    self.assertNotEqual(assign.uop.shape, a.uop.shape)
     assign.realize()
     self.assertEqual(a.tolist(), [1, 0, 1, 1])
 
@@ -622,13 +623,13 @@ class TestShapeSpec(unittest.TestCase):
 
   def test_ops_st(self):
     # view / mop
-    a = Tensor.empty(4, 2, 1).permute((1, 2, 0)).lazydata
+    a = Tensor.empty(4, 2, 1).permute((1, 2, 0)).uop
     self.assertEqual(a.st, ShapeTracker.from_shape((4, 2, 1)).permute((1, 2, 0)))
     # alu / reduce
     alu = a*2
     self.assertEqual(alu.st, ShapeTracker.from_shape((2, 1, 4)))
     r = Tensor.empty(4, 4).sum(axis=1)
-    self.assertEqual(r.lazydata.st, ShapeTracker.from_shape((4,)))
+    self.assertEqual(r.uop.st, ShapeTracker.from_shape((4,)))
 
   def test_st_wmma_none(self):
     A = UOp(Ops.DEFINE_VAR, dtypes.float.vec(16), arg=('a', UOp.const(dtypes.float, 0), UOp.const(dtypes.float, 1)))
