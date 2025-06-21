@@ -1,12 +1,12 @@
 from typing import cast, Callable
 from tinygrad.uop.ops import PatternMatcher, UPat, GroupOp, Ops, UOp, print_uops, python_alu, graph_rewrite, resolve
 from tinygrad.dtype import DType, ImageDType, dtypes, PtrDType
-from tinygrad.helpers import all_same, prod, DEBUG, IGNORE_OOB, Context
+from tinygrad.helpers import all_same, prod, DEBUG, ContextVar, Context
 try:
   import z3
 
-  # IDIV is truncated division but z3 does floored division; mod by power of two sometimes uses Ops.AND
-  def z3_cdiv(a,b): return z3.If(a<0, (a+(b-1))/b, a/b)
+  # IDIV is truncated division but z3 does euclidian division (floor if b>0 ceil otherwise); mod by power of two sometimes uses Ops.AND
+  def z3_cdiv(a, b):return z3.If((a<0), z3.If(0<b, (a+(b-1))/b, (a-(b+1))/b), a/b)
   z3_alu: dict[Ops, Callable] = python_alu | {Ops.MOD: lambda a,b: a-z3_cdiv(a,b)*b, Ops.IDIV: z3_cdiv, Ops.SHR: lambda a,b: a/(2**b.as_long()),
     Ops.SHL: lambda a,b: a*(2**b.as_long()), Ops.AND: lambda a,b: a%(b+1) if isinstance(b, z3.ArithRef) else a&b, Ops.WHERE: z3.If,
     Ops.MAX: lambda a,b: z3.If(a<b, b, a)}
@@ -25,11 +25,16 @@ try:
     (UPat(Ops.LOAD, name="x"), lambda x,ctx: UOp(Ops.NOOP, arg=create_bounded(f"load{ctx[1].setdefault(x, len(ctx[1]))}", x.vmin, x.vmax, ctx[0]))),
     (UPat(Ops.CONST, name="x"), lambda x,ctx: UOp(Ops.NOOP, arg=(z3.BoolVal if dtypes.is_bool(x.dtype) else z3.IntVal)(x.arg, ctx=ctx[0].ctx))),
     (UPat(Ops.CAST, name="x"), lambda x: x.src[0]),
+    (UPat(Ops.XOR, src=UPat(Ops.NOOP), name="x"),
+      lambda x: UOp(Ops.NOOP, arg=z3.BV2Int(z3_alu[x.op](*(z3.Int2BV(s.arg, x.dtype.itemsize*8) for s in x.src))))),
     (UPat(GroupOp.ALU, src=UPat(Ops.NOOP), name="x"), lambda x: UOp(Ops.NOOP, arg=z3_alu[x.op](*(s.arg for s in x.src)))),
   ])
 
   z3_imported = True
 except (ImportError, AttributeError): z3_imported = False
+
+# if you have z3 installed, by default we check the bounds
+IGNORE_OOB = ContextVar("IGNORE_OOB", int(not z3_imported))
 
 buffer_spec = PatternMatcher([
   (UPat(Ops.UNIQUE, dtypes.void, ()), lambda: True),
@@ -39,24 +44,23 @@ buffer_spec = PatternMatcher([
    lambda buf: isinstance(buf.arg, int) and isinstance(buf.dtype, (DType, ImageDType))),
   (UPat(Ops.BUFFER_VIEW, src=(UPat(Ops.BUFFER),), name="buf_view"),
    lambda buf_view: isinstance(buf_view.arg, tuple) and len(buf_view.arg) == 2 and all(isinstance(arg, (int, UOp)) for arg in buf_view.arg)),
+  (UPat(Ops.BUFFER_VIEW, src=(UPat(Ops.MSTACK, src=UPat(Ops.BUFFER)),)), lambda: True),
   # allow VIEW here. TODO: what views specifically are allowed? does this mess with gradient?
   (UPat(Ops.VIEW), lambda: True),
 ])
 
-def validate_kernel(k:UOp):
-  assert k.arg.ast.op in {Ops.COPY, Ops.BUFFER_VIEW, Ops.SINK}, f"must end with SINK/COPY/BUFFER_VIEW {k.arg}"
-  if k.arg.ast.op is Ops.SINK: assert all(s.op is Ops.STORE for s in k.arg.ast.src), f"SINK must end with STORE {k.arg.ast}"
-  return True
-
 assign_spec = PatternMatcher([
   # KERNEL can attach to an ASSIGN to describe the compute required to realize a BUFFER
-  (UPat(Ops.KERNEL, src=UPat((Ops.BUFFER, Ops.BUFFER_VIEW, Ops.ASSIGN, Ops.MSELECT)), name="k"), validate_kernel),
+  (UPat(Ops.KERNEL, src=UPat((Ops.BUFFER, Ops.BUFFER_VIEW, Ops.ASSIGN, Ops.MSELECT, Ops.MSTACK))), lambda: True),
 
   # ASSIGN has a target and a value. It can also optionally depend on other assigns
   (UPat(Ops.ASSIGN, name="x"), lambda x: len(x.src) >= 2 and all(s.op is Ops.ASSIGN for s in x.src[2:])),
 
   # MSELECT chooses one of the multi buffers
   (UPat(Ops.MSELECT, name="x"), lambda x: isinstance(x.src[0].device, tuple) and x.arg < len(x.src[0].device)),
+
+  # MSTACK combines buffers into multi
+  (UPat(Ops.MSTACK, name="x"), lambda x: all(isinstance(x.device, str) for x in x.src)),
 ])
 
 # *** this is the spec of a Tensor in UOp ***
